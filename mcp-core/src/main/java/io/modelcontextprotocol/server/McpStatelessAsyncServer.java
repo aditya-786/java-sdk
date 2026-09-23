@@ -80,6 +80,8 @@ public class McpStatelessAsyncServer {
 
 	private final boolean validateToolInputs;
 
+	private final McpAsyncListFilter<McpSchema.Tool> toolFilter;
+
 	McpStatelessAsyncServer(McpStatelessServerTransport mcpTransport, McpJsonMapper jsonMapper,
 			McpStatelessServerFeatures.Async features, Duration requestTimeout,
 			McpUriTemplateManagerFactory uriTemplateManagerFactory, JsonSchemaValidator jsonSchemaValidator,
@@ -97,6 +99,7 @@ public class McpStatelessAsyncServer {
 		this.uriTemplateManagerFactory = uriTemplateManagerFactory;
 		this.jsonSchemaValidator = jsonSchemaValidator;
 		this.validateToolInputs = validateToolInputs;
+		this.toolFilter = McpAsyncListFilter.and(features.toolFilters());
 
 		Map<String, McpStatelessRequestHandler<?>> requestHandlers = new HashMap<>();
 
@@ -133,8 +136,24 @@ public class McpStatelessAsyncServer {
 
 		this.protocolVersions = new ArrayList<>(mcpTransport.protocolVersions());
 
-		McpStatelessServerHandler handler = new DefaultMcpStatelessServerHandler(requestHandlers, Map.of());
+		Map<String, McpStatelessNotificationHandler> notificationHandlers = prepareNotificationHandlers();
+		McpStatelessServerHandler handler = new DefaultMcpStatelessServerHandler(requestHandlers, notificationHandlers);
 		mcpTransport.setMcpHandler(handler);
+	}
+
+	private Map<String, McpStatelessNotificationHandler> prepareNotificationHandlers() {
+		Map<String, McpStatelessNotificationHandler> notificationHandlers = new HashMap<>();
+
+		notificationHandlers.put(McpSchema.METHOD_NOTIFICATION_INITIALIZED, (exchange, params) -> {
+			logger.debug("Received {}", McpSchema.METHOD_NOTIFICATION_INITIALIZED);
+			return Mono.empty();
+		});
+		notificationHandlers.put(McpSchema.METHOD_NOTIFICATION_ROOTS_LIST_CHANGED, (exchange, params) -> {
+			logger.debug("Received {}", McpSchema.METHOD_NOTIFICATION_ROOTS_LIST_CHANGED);
+			return Mono.empty();
+		});
+
+		return notificationHandlers;
 	}
 
 	// ---------------------------------------
@@ -401,11 +420,30 @@ public class McpStatelessAsyncServer {
 
 	private McpStatelessRequestHandler<McpSchema.ListToolsResult> toolsListRequestHandler() {
 		return (ctx, params) -> {
-			List<Tool> tools = this.tools.stream()
+			// TODO: Implement pagination. Cursors must be computed over the filtered
+			// view, otherwise page offsets leak the number of hidden tools.
+			return Flux.fromIterable(this.tools)
 				.map(McpStatelessServerFeatures.AsyncToolSpecification::tool)
-				.toList();
-			return Mono.just(McpSchema.ListToolsResult.builder(tools).build());
+				.filterWhen(tool -> this.toolFilter.isVisible(ctx, tool)
+					.onErrorResume(error -> opaqueListFilterError(tool, error)))
+				.collectList()
+				.map(tools -> McpSchema.ListToolsResult.builder(tools).build());
 		};
+	}
+
+	/**
+	 * Report a list filter failure to the client as an opaque {@code -32603} error, so
+	 * that filter internals such as identity provider hostnames or the reason a principal
+	 * was rejected never leave the server. The actual cause is logged instead. An
+	 * {@link McpError} is deliberate on the filter's part and passes through untouched.
+	 */
+	private static Mono<Boolean> opaqueListFilterError(Tool tool, Throwable error) {
+		if (error instanceof McpError mcpError && mcpError.getJsonRpcError() != null) {
+			logger.debug("Tool list filter failed for tool '{}' with an explicit MCP error", tool.name(), error);
+			return Mono.error(mcpError);
+		}
+		logger.error("Tool list filter failed for tool '{}', failing the tools/list request", tool.name(), error);
+		return Mono.error(McpError.builder(ErrorCodes.INTERNAL_ERROR).message("Internal error").build());
 	}
 
 	private McpStatelessRequestHandler<CallToolResult> toolsCallRequestHandler() {
